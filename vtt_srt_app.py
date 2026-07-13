@@ -10,16 +10,21 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter v1", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v2", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
 
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
 
-# Flair's large four-class model recognizes PER, ORG, LOC, and MISC and is
-# multilingual enough for the app's English, Spanish, and Portuguese workflow.
-FLAIR_MODEL_ID = "ner-large"
+# Language-specific spaCy pipelines used for named-entity recognition.
+# The large CPU pipelines include an NER component and support the labels needed
+# for this app's English, Spanish, and Portuguese workflow.
+SPACY_MODEL_IDS = {
+    "en": "en_core_web_lg",
+    "es": "es_core_news_lg",
+    "pt": "pt_core_news_lg",
+}
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -48,7 +53,7 @@ UI_TEXT = {
         "intro": (
             "Upload one or more SRT files and convert them into TSV tables. "
             "Milliseconds and SRT sequence numbers are omitted, session titles are carried "
-            "forward, and Flair extracts people, organizations, and places."
+            "forward, and spaCy extracts people, organizations, and places."
         ),
         "session_help_title": "SRT session-title format",
         "session_help": """
@@ -72,7 +77,7 @@ Our first speaker is Ana Silva.
             "independent of the interface language."
         ),
         "ner_note": (
-            "Flair identifies people, organizations, and locations. Person names are inverted "
+            "spaCy identifies people, organizations, and locations. Person names are inverted "
             "heuristically to Family name, Given name. NER results and geographic matches "
             "should be reviewed."
         ),
@@ -83,7 +88,7 @@ Our first speaker is Ana Silva.
             "state reference omits lower levels; unresolved names remain in their detected form."
         ),
         "privacy_note": (
-            "Location resolution requires internet access and sends only Flair-detected place "
+            "Location resolution requires internet access and sends only spaCy-detected place "
             "names—not the complete subtitle text—to Nominatim."
         ),
         "osm_attribution": (
@@ -109,9 +114,9 @@ Named entities are identified from the original subtitle cues before merging. Ev
         "max_chars": "Maximum characters per subtitle block",
         "max_help": "Merged blocks will not exceed this length unless one original cue is already longer.",
         "uploader": "Choose one or more .srt files",
-        "spinner_model": "Loading the Flair named-entity recognition model...",
+        "spinner_model": "Loading the spaCy named-entity recognition model...",
         "spinner_processing": "Processing uploaded files...",
-        "missing_model": "Flair or its named-entity model could not be loaded.",
+        "missing_model": "spaCy or its language model could not be loaded.",
         "install_intro": "Install the dependencies and restart the app:",
         "decode_error": "Could not decode {filename} as UTF-8.",
         "no_cues": "No valid SRT cues were found in {filename}.",
@@ -133,7 +138,7 @@ Named entities are identified from the original subtitle cues before merging. Ev
         "intro": (
             "Suba uno o más archivos SRT y conviértalos en tablas TSV. Se omiten los "
             "milisegundos y los números de secuencia, se conservan los títulos de sesión y "
-            "Flair extrae personas, organizaciones y lugares."
+            "spaCy extrae personas, organizaciones y lugares."
         ),
         "session_help_title": "Formato del título de sesión en el SRT",
         "session_help": """
@@ -157,7 +162,7 @@ Nuestra primera ponente es Ana Silva.
             "independiente del idioma de la interfaz."
         ),
         "ner_note": (
-            "Flair identifica personas, organizaciones y lugares. Los nombres de personas se "
+            "spaCy identifica personas, organizaciones y lugares. Los nombres de personas se "
             "invierten de manera heurística a Apellido, Nombre. Se deben revisar los resultados "
             "del reconocimiento y las coincidencias geográficas."
         ),
@@ -169,7 +174,7 @@ Nuestra primera ponente es Ana Silva.
         ),
         "privacy_note": (
             "La resolución geográfica requiere internet y solo envía a Nominatim los nombres de "
-            "lugar detectados por Flair, no el texto completo de los subtítulos."
+            "lugar detectados por spaCy, no el texto completo de los subtítulos."
         ),
         "osm_attribution": (
             "Datos geográficos © [colaboradores de OpenStreetMap]"
@@ -194,9 +199,9 @@ Las entidades se identifican en las secuencias originales antes de unirlas. Cada
         "max_chars": "Número máximo de caracteres por bloque de subtítulos",
         "max_help": "Los bloques no superarán esta extensión, salvo que una secuencia original ya sea más larga.",
         "uploader": "Seleccione uno o más archivos .srt",
-        "spinner_model": "Cargando el modelo de reconocimiento de entidades de Flair...",
+        "spinner_model": "Cargando el modelo de reconocimiento de entidades de spaCy...",
         "spinner_processing": "Procesando los archivos subidos...",
-        "missing_model": "No se pudo cargar Flair o su modelo de reconocimiento de entidades.",
+        "missing_model": "No se pudo cargar spaCy o su modelo de idioma.",
         "install_intro": "Instale las dependencias y reinicie la aplicación:",
         "decode_error": "No se pudo decodificar {filename} como UTF-8.",
         "no_cues": "No se encontraron secuencias SRT válidas en {filename}.",
@@ -218,7 +223,7 @@ Las entidades se identifican en las secuencias originales antes de unirlas. Cada
         "intro": (
             "Envie um ou mais arquivos SRT e converta-os em tabelas TSV. Os milissegundos e "
             "os números de sequência são omitidos, os títulos das sessões são mantidos e o "
-            "Flair extrai pessoas, organizações e lugares."
+            "spaCy extrai pessoas, organizações e lugares."
         ),
         "session_help_title": "Formato do título da sessão no SRT",
         "session_help": """
@@ -242,7 +247,7 @@ Nossa primeira palestrante é Ana Silva.
             "do idioma da interface."
         ),
         "ner_note": (
-            "O Flair identifica pessoas, organizações e lugares. Os nomes de pessoas são "
+            "O spaCy identifica pessoas, organizações e lugares. Os nomes de pessoas são "
             "invertidos de forma heurística para Sobrenome, Nome. Os resultados do reconhecimento "
             "e as correspondências geográficas devem ser revisados."
         ),
@@ -254,7 +259,7 @@ Nossa primeira palestrante é Ana Silva.
         ),
         "privacy_note": (
             "A resolução geográfica requer internet e envia ao Nominatim apenas os nomes de "
-            "lugares detectados pelo Flair, não o texto completo das legendas."
+            "lugares detectados pelo spaCy, não o texto completo das legendas."
         ),
         "osm_attribution": (
             "Dados geográficos © [colaboradores do OpenStreetMap]"
@@ -279,9 +284,9 @@ As entidades são identificadas nas sequências originais antes da união. Cada 
         "max_chars": "Máximo de caracteres por bloco de legendas",
         "max_help": "Os blocos não ultrapassarão este tamanho, salvo quando uma sequência original já for maior.",
         "uploader": "Escolha um ou mais arquivos .srt",
-        "spinner_model": "Carregando o modelo de reconhecimento de entidades do Flair...",
+        "spinner_model": "Carregando o modelo de reconhecimento de entidades do spaCy...",
         "spinner_processing": "Processando os arquivos enviados...",
-        "missing_model": "Não foi possível carregar o Flair ou seu modelo de reconhecimento de entidades.",
+        "missing_model": "Não foi possível carregar o spaCy ou seu modelo de idioma.",
         "install_intro": "Instale as dependências e reinicie o aplicativo:",
         "decode_error": "Não foi possível decodificar {filename} como UTF-8.",
         "no_cues": "Nenhuma sequência SRT válida foi encontrada em {filename}.",
@@ -652,13 +657,26 @@ def cues_to_simple_records(cues: Iterable[SRTCue]) -> list[OutputRecord]:
     ]
 
 
-# ---------- Named-entity recognition with Flair ----------
+# ---------- Named-entity recognition with spaCy ----------
 
 @st.cache_resource(show_spinner=False)
-def load_ner_model() -> Any:
-    from flair.nn import Classifier
+def load_ner_model(language_code: str) -> Any:
+    """Load the language-specific spaCy pipeline and keep only NER dependencies active."""
+    import spacy
 
-    return Classifier.load(FLAIR_MODEL_ID)
+    model_name = SPACY_MODEL_IDS[language_code]
+    nlp = spacy.load(model_name)
+
+    # Disable components that are not required for NER. Keep tok2vec or transformer
+    # active when present because the entity recognizer depends on their features.
+    required_components = {"ner", "tok2vec", "transformer"}
+    unused_components = [
+        component for component in nlp.pipe_names if component not in required_components
+    ]
+    if unused_components:
+        nlp.disable_pipes(*unused_components)
+
+    return nlp
 
 
 def clean_text_for_ner(text: str) -> str:
@@ -724,42 +742,21 @@ def deduplicate_preserving_order(values: Iterable[str]) -> list[str]:
     return output
 
 
-def _span_label_value(span: Any) -> str:
-    """Read a Flair span label across current and older supported Flair APIs."""
-    try:
-        return str(span.get_label("ner").value)
-    except (AttributeError, IndexError, KeyError):
-        labels = getattr(span, "labels", [])
-        return str(labels[0].value) if labels else ""
-
-
-def extract_raw_entities_batch(texts: Iterable[str], tagger: Any) -> list[EntityBundle]:
-    """Run Flair NER over subtitle cues and return detected raw entities per cue."""
-    from flair.data import Sentence
-
+def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBundle]:
+    """Run spaCy NER over subtitle cues and return detected raw entities per cue."""
     cleaned_texts = [clean_text_for_ner(text) for text in texts]
-    results = [EntityBundle() for _ in cleaned_texts]
+    results: list[EntityBundle] = []
 
-    sentence_indices: list[int] = []
-    sentences: list[Any] = []
-    for index, text in enumerate(cleaned_texts):
-        if text:
-            sentence_indices.append(index)
-            sentences.append(Sentence(text))
-
-    if not sentences:
-        return results
-
-    tagger.predict(sentences, mini_batch_size=16)
-
-    for source_index, sentence in zip(sentence_indices, sentences):
+    # nlp.pipe batches the subtitles efficiently while preserving input order,
+    # including empty cues.
+    for doc in nlp.pipe(cleaned_texts, batch_size=64):
         people: list[str] = []
         organizations: list[str] = []
         places: list[str] = []
 
-        for span in sentence.get_spans("ner"):
-            label = _span_label_value(span).upper()
-            entity_text = clean_entity_value(getattr(span, "text", ""))
+        for entity in doc.ents:
+            label = str(entity.label_).upper()
+            entity_text = clean_entity_value(entity.text)
             if not entity_text:
                 continue
 
@@ -777,10 +774,12 @@ def extract_raw_entities_batch(texts: Iterable[str], tagger: Any) -> list[Entity
                 else:
                     organizations.append(entity_text)
 
-        results[source_index] = EntityBundle(
-            people=tuple(deduplicate_preserving_order(people)),
-            organizations=tuple(deduplicate_preserving_order(organizations)),
-            places=tuple(deduplicate_preserving_order(places)),
+        results.append(
+            EntityBundle(
+                people=tuple(deduplicate_preserving_order(people)),
+                organizations=tuple(deduplicate_preserving_order(organizations)),
+                places=tuple(deduplicate_preserving_order(places)),
+            )
         )
 
     return results
@@ -794,7 +793,7 @@ def get_geocode_rate_limiter() -> Any:
     from geopy.geocoders import Nominatim
 
     geocoder = Nominatim(
-        user_agent="srt-to-tsv-flair-ner/1.0",
+        user_agent="srt-to-tsv-spacy-ner/2.0",
         timeout=12,
     )
     return RateLimiter(
@@ -822,7 +821,7 @@ def first_display_component(location: Any) -> str:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24 * 30)
 def resolve_location_hierarchy(location_name: str, language_code: str) -> str:
     """
-    Resolve a Flair-detected location to country--state/department/diocese--city.
+    Resolve a spaCy-detected location to country--state/department/diocese--city.
 
     The hierarchy stops at the type of place referenced: countries omit state and
     city; first-level administrative units omit city; populated places include all
@@ -900,7 +899,7 @@ def resolve_location_hierarchy(location_name: str, language_code: str) -> str:
 
 def aggregate_session_entities(
     cues: Iterable[SRTCue],
-    tagger: Any,
+    nlp: Any,
     language_code: str,
     resolve_places: bool = True,
     location_resolver: LocationResolver = resolve_location_hierarchy,
@@ -912,7 +911,7 @@ def aggregate_session_entities(
     intentionally based on original cues rather than merged output rows.
     """
     cue_list = list(cues)
-    raw_entities = extract_raw_entities_batch((cue.text for cue in cue_list), tagger)
+    raw_entities = extract_raw_entities_batch((cue.text for cue in cue_list), nlp)
 
     session_people: dict[int, list[str]] = {}
     session_organizations: dict[int, list[str]] = {}
@@ -1026,7 +1025,7 @@ def entities_to_txt(
 
 def convert_srt(
     file_content: str,
-    tagger: Any,
+    nlp: Any,
     language_code: str,
     resolve_places: bool = True,
     merge_by_speaker: bool = False,
@@ -1050,7 +1049,7 @@ def convert_srt(
 
     session_entities, file_entities = aggregate_session_entities(
         cues,
-        tagger=tagger,
+        nlp=nlp,
         language_code=language_code,
         resolve_places=resolve_places,
         location_resolver=location_resolver,
@@ -1143,11 +1142,17 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     try:
         with st.spinner(T["spinner_model"]):
-            ner_model = load_ner_model()
+            ner_model = load_ner_model(ner_language)
     except Exception as error:
-        st.error(f"{T['missing_model']} ({FLAIR_MODEL_ID})")
+        st.error(f"{T['missing_model']} ({SPACY_MODEL_IDS[ner_language]})")
         st.write(T["install_intro"])
-        st.code("pip install -r requirements.txt", language="bash")
+        st.code(
+            "pip install -r requirements.txt\n"
+            "python -m spacy download en_core_web_lg\n"
+            "python -m spacy download es_core_news_lg\n"
+            "python -m spacy download pt_core_news_lg",
+            language="bash",
+        )
         st.exception(error)
         st.stop()
 
@@ -1170,7 +1175,7 @@ if uploaded_files:
 
             tsv_text, entity_txt, row_count = convert_srt(
                 file_text,
-                tagger=ner_model,
+                nlp=ner_model,
                 language_code=ner_language,
                 resolve_places=resolve_places_option,
                 merge_by_speaker=(mode == "merged"),
