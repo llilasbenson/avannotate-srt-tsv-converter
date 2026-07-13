@@ -13,12 +13,12 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter v3", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v5", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
 
-APP_VERSION = "3.0"
+APP_VERSION = "5.0"
 
 # Language-specific spaCy pipelines used for named-entity recognition.
 # The requirements file installs the small pipelines. The loader also accepts
@@ -87,8 +87,10 @@ Our first speaker is Ana Silva.
         ),
         "ner_note": (
             "spaCy identifies people, organizations, and locations. Person names are inverted "
-            "heuristically to Family name, Given name. NER results and geographic matches "
-            "should be reviewed."
+            "heuristically to Family name, Given name. One-word entities are preserved when "
+            "they are nouns or proper nouns—including countries and place names—but detections "
+            "tagged as verbs, auxiliary verbs, or adjectives are excluded. NER results and "
+            "geographic matches should be reviewed."
         ),
         "resolve_places": "Resolve place names to geographic hierarchies",
         "resolve_places_help": (
@@ -175,8 +177,10 @@ Nuestra primera ponente es Ana Silva.
         ),
         "ner_note": (
             "spaCy identifica personas, organizaciones y lugares. Los nombres de personas se "
-            "invierten de manera heurística a Apellido, Nombre. Se deben revisar los resultados "
-            "del reconocimiento y las coincidencias geográficas."
+            "invierten de manera heurística a Apellido, Nombre. Se conservan las entidades de una "
+            "sola palabra cuando son sustantivos o nombres propios, incluidos países y lugares, "
+            "pero se excluyen las detecciones etiquetadas como verbos, verbos auxiliares o "
+            "adjetivos. Se deben revisar los resultados y las coincidencias geográficas."
         ),
         "resolve_places": "Resolver los lugares como jerarquías geográficas",
         "resolve_places_help": (
@@ -263,8 +267,10 @@ Nossa primeira palestrante é Ana Silva.
         ),
         "ner_note": (
             "O spaCy identifica pessoas, organizações e lugares. Os nomes de pessoas são "
-            "invertidos de forma heurística para Sobrenome, Nome. Os resultados do reconhecimento "
-            "e as correspondências geográficas devem ser revisados."
+            "invertidos de forma heurística para Sobrenome, Nome. Entidades de uma única palavra "
+            "são preservadas quando são substantivos ou nomes próprios, incluindo países e "
+            "lugares, mas detecções marcadas como verbos, verbos auxiliares ou adjetivos são "
+            "excluídas. Os resultados e as correspondências geográficas devem ser revisados."
         ),
         "resolve_places": "Resolver lugares como hierarquias geográficas",
         "resolve_places_help": (
@@ -678,8 +684,15 @@ def cues_to_simple_records(cues: Iterable[SRTCue]) -> list[OutputRecord]:
 # ---------- Named-entity recognition with spaCy ----------
 
 def _prepare_spacy_ner_pipeline(nlp: Any) -> Any:
-    """Disable components that are not required by the NER pipeline."""
-    required_components = {"ner", "tok2vec", "transformer"}
+    """Keep NER and part-of-speech components needed for precision filtering."""
+    required_components = {
+        "ner",
+        "tok2vec",
+        "transformer",
+        "tagger",
+        "morphologizer",
+        "attribute_ruler",
+    }
     unused_components = [
         component for component in nlp.pipe_names if component not in required_components
     ]
@@ -716,7 +729,7 @@ def load_ner_model(language_code: str) -> tuple[Any, str, bool]:
             load_errors.append(f"{model_name}: {error}")
 
     # requirements.txt should normally install the preferred small model before
-    # Streamlit starts. This fallback helps when only app_v3.py was copied into a
+    # Streamlit starts. This fallback helps when only app_v5.py was copied into a
     # deployment or when the model dependency was accidentally omitted.
     preferred_model = SPACY_MODEL_IDS[language_code]
     try:
@@ -810,8 +823,41 @@ def deduplicate_preserving_order(values: Iterable[str]) -> list[str]:
     return output
 
 
+SINGLE_WORD_REJECTED_POS = {"VERB", "AUX", "ADJ"}
+
+
+def entity_word_tokens(entity: Any) -> list[Any]:
+    """Return non-space, non-punctuation tokens from a spaCy entity span."""
+    return [
+        token
+        for token in entity
+        if not token.is_space and not token.is_punct and token.text.strip()
+    ]
+
+
+def should_keep_entity(entity: Any) -> bool:
+    """Keep multi-word entities and legitimate one-word named entities.
+
+    Single-token countries, cities, organizations, and personal names are
+    preserved unless spaCy's part-of-speech analysis identifies the token as
+    a verb, auxiliary verb, or adjective. This removes common subtitle false
+    positives while retaining place names such as "México", "Brasil", or
+    "Lisboa". If a model does not provide a POS tag, the entity is retained
+    rather than discarding a potentially valid name.
+    """
+    word_tokens = entity_word_tokens(entity)
+    if not word_tokens:
+        return False
+    if len(word_tokens) >= 2:
+        return True
+
+    token = word_tokens[0]
+    pos = str(getattr(token, "pos_", "") or "").upper()
+    return pos not in SINGLE_WORD_REJECTED_POS
+
+
 def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBundle]:
-    """Run spaCy NER over subtitle cues and return detected raw entities per cue."""
+    """Run spaCy NER and return precision-filtered named entities for each cue."""
     cleaned_texts = [clean_text_for_ner(text) for text in texts]
     results: list[EntityBundle] = []
 
@@ -823,6 +869,11 @@ def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBun
         places: list[str] = []
 
         for entity in doc.ents:
+            # Preserve legitimate one-word names and places, but reject
+            # one-word false positives that spaCy tags as verbs or adjectives.
+            if not should_keep_entity(entity):
+                continue
+
             label = str(entity.label_).upper()
             entity_text = clean_entity_value(entity.text)
             if not entity_text:
@@ -861,7 +912,7 @@ def get_geocode_rate_limiter() -> Any:
     from geopy.geocoders import Nominatim
 
     geocoder = Nominatim(
-        user_agent="srt-to-tsv-spacy-ner/3.0",
+        user_agent="srt-to-tsv-spacy-ner/5.0",
         timeout=12,
     )
     return RateLimiter(
