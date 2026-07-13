@@ -1,7 +1,10 @@
 import csv
 import html
+import importlib
 import io
 import re
+import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass
 from datetime import timedelta
@@ -10,20 +13,26 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter v2", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v3", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
 
-APP_VERSION = "2.0"
+APP_VERSION = "3.0"
 
 # Language-specific spaCy pipelines used for named-entity recognition.
-# The large CPU pipelines include an NER component and support the labels needed
-# for this app's English, Spanish, and Portuguese workflow.
+# The requirements file installs the small pipelines. The loader also accepts
+# medium or large pipelines when a deployment already provides them.
 SPACY_MODEL_IDS = {
-    "en": "en_core_web_lg",
-    "es": "es_core_news_lg",
-    "pt": "pt_core_news_lg",
+    "en": "en_core_web_sm",
+    "es": "es_core_news_sm",
+    "pt": "pt_core_news_sm",
+}
+
+SPACY_MODEL_CANDIDATES = {
+    "en": ("en_core_web_sm", "en_core_web_md", "en_core_web_lg"),
+    "es": ("es_core_news_sm", "es_core_news_md", "es_core_news_lg"),
+    "pt": ("pt_core_news_sm", "pt_core_news_md", "pt_core_news_lg"),
 }
 
 LANGUAGE_NAMES = {
@@ -118,6 +127,9 @@ Named entities are identified from the original subtitle cues before merging. Ev
         "spinner_processing": "Processing uploaded files...",
         "missing_model": "spaCy or its language model could not be loaded.",
         "install_intro": "Install the dependencies and restart the app:",
+        "model_loaded": "Using spaCy model: {model}.",
+        "model_downloaded": "Downloaded and loaded the missing spaCy model: {model}.",
+        "model_attempts": "Attempted models: {models}.",
         "decode_error": "Could not decode {filename} as UTF-8.",
         "no_cues": "No valid SRT cues were found in {filename}.",
         "preview": "Preview of TSV output for {filename} (first 20 lines)",
@@ -203,6 +215,9 @@ Las entidades se identifican en las secuencias originales antes de unirlas. Cada
         "spinner_processing": "Procesando los archivos subidos...",
         "missing_model": "No se pudo cargar spaCy o su modelo de idioma.",
         "install_intro": "Instale las dependencias y reinicie la aplicación:",
+        "model_loaded": "Modelo de spaCy en uso: {model}.",
+        "model_downloaded": "Se descargó y cargó el modelo de spaCy faltante: {model}.",
+        "model_attempts": "Modelos probados: {models}.",
         "decode_error": "No se pudo decodificar {filename} como UTF-8.",
         "no_cues": "No se encontraron secuencias SRT válidas en {filename}.",
         "preview": "Vista previa del TSV de {filename} (primeras 20 líneas)",
@@ -288,6 +303,9 @@ As entidades são identificadas nas sequências originais antes da união. Cada 
         "spinner_processing": "Processando os arquivos enviados...",
         "missing_model": "Não foi possível carregar o spaCy ou seu modelo de idioma.",
         "install_intro": "Instale as dependências e reinicie o aplicativo:",
+        "model_loaded": "Modelo spaCy em uso: {model}.",
+        "model_downloaded": "O modelo spaCy ausente foi baixado e carregado: {model}.",
+        "model_attempts": "Modelos testados: {models}.",
         "decode_error": "Não foi possível decodificar {filename} como UTF-8.",
         "no_cues": "Nenhuma sequência SRT válida foi encontrada em {filename}.",
         "preview": "Prévia do TSV de {filename} (primeiras 20 linhas)",
@@ -659,24 +677,74 @@ def cues_to_simple_records(cues: Iterable[SRTCue]) -> list[OutputRecord]:
 
 # ---------- Named-entity recognition with spaCy ----------
 
-@st.cache_resource(show_spinner=False)
-def load_ner_model(language_code: str) -> Any:
-    """Load the language-specific spaCy pipeline and keep only NER dependencies active."""
-    import spacy
-
-    model_name = SPACY_MODEL_IDS[language_code]
-    nlp = spacy.load(model_name)
-
-    # Disable components that are not required for NER. Keep tok2vec or transformer
-    # active when present because the entity recognizer depends on their features.
+def _prepare_spacy_ner_pipeline(nlp: Any) -> Any:
+    """Disable components that are not required by the NER pipeline."""
     required_components = {"ner", "tok2vec", "transformer"}
     unused_components = [
         component for component in nlp.pipe_names if component not in required_components
     ]
     if unused_components:
         nlp.disable_pipes(*unused_components)
-
     return nlp
+
+
+@st.cache_resource(show_spinner=False)
+def load_ner_model(language_code: str) -> tuple[Any, str, bool]:
+    """
+    Load an installed spaCy NER pipeline without crashing on a missing package.
+
+    The small model listed in requirements.txt is tried first. Medium and large
+    variants are accepted as fallbacks for deployments that already include them.
+    If no candidate is installed, the function makes one best-effort download of
+    the small model and then retries it.
+
+    Returns: (nlp_pipeline, loaded_model_name, downloaded_during_this_run).
+    """
+    import spacy
+
+    if language_code not in SPACY_MODEL_CANDIDATES:
+        raise ValueError(f"Unsupported NER language: {language_code}")
+
+    candidates = SPACY_MODEL_CANDIDATES[language_code]
+    load_errors: list[str] = []
+
+    for model_name in candidates:
+        try:
+            nlp = spacy.load(model_name)
+            return _prepare_spacy_ner_pipeline(nlp), model_name, False
+        except (OSError, IOError, ImportError) as error:
+            load_errors.append(f"{model_name}: {error}")
+
+    # requirements.txt should normally install the preferred small model before
+    # Streamlit starts. This fallback helps when only app_v3.py was copied into a
+    # deployment or when the model dependency was accidentally omitted.
+    preferred_model = SPACY_MODEL_IDS[language_code]
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "spacy", "download", preferred_model],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if completed.returncode == 0:
+            importlib.invalidate_caches()
+            nlp = spacy.load(preferred_model)
+            return _prepare_spacy_ner_pipeline(nlp), preferred_model, True
+
+        detail = (completed.stderr or completed.stdout or "download failed").strip()
+        load_errors.append(f"{preferred_model} download: {detail}")
+    except (OSError, subprocess.SubprocessError, TimeoutError) as error:
+        load_errors.append(f"{preferred_model} download: {error}")
+    except (OSError, IOError, ImportError) as error:
+        load_errors.append(f"{preferred_model} reload: {error}")
+
+    attempted = ", ".join(candidates)
+    details = " | ".join(load_errors[-4:])
+    raise RuntimeError(
+        f"No trained spaCy NER model could be loaded. Attempted: {attempted}. "
+        f"Details: {details}"
+    )
 
 
 def clean_text_for_ner(text: str) -> str:
@@ -793,7 +861,7 @@ def get_geocode_rate_limiter() -> Any:
     from geopy.geocoders import Nominatim
 
     geocoder = Nominatim(
-        user_agent="srt-to-tsv-spacy-ner/2.0",
+        user_agent="srt-to-tsv-spacy-ner/3.0",
         timeout=12,
     )
     return RateLimiter(
@@ -1142,19 +1210,26 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     try:
         with st.spinner(T["spinner_model"]):
-            ner_model = load_ner_model(ner_language)
+            ner_model, loaded_model_name, downloaded_model = load_ner_model(ner_language)
     except Exception as error:
+        attempted_models = ", ".join(SPACY_MODEL_CANDIDATES[ner_language])
         st.error(f"{T['missing_model']} ({SPACY_MODEL_IDS[ner_language]})")
         st.write(T["install_intro"])
         st.code(
             "pip install -r requirements.txt\n"
-            "python -m spacy download en_core_web_lg\n"
-            "python -m spacy download es_core_news_lg\n"
-            "python -m spacy download pt_core_news_lg",
+            "python -m spacy download en_core_web_sm\n"
+            "python -m spacy download es_core_news_sm\n"
+            "python -m spacy download pt_core_news_sm",
             language="bash",
         )
-        st.exception(error)
+        st.caption(T["model_attempts"].format(models=attempted_models))
+        st.caption(str(error))
         st.stop()
+
+    if downloaded_model:
+        st.info(T["model_downloaded"].format(model=loaded_model_name))
+    else:
+        st.caption(T["model_loaded"].format(model=loaded_model_name))
 
     results: list[tuple[str, str, str, int]] = []
     txt_headings = {
