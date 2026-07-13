@@ -13,12 +13,12 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter v7", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v8", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
 
-APP_VERSION = "7.0"
+APP_VERSION = "8.0"
 
 # Language-specific spaCy pipelines used for named-entity recognition.
 # The requirements file installs the small pipelines. The loader also accepts
@@ -45,14 +45,17 @@ PERSON_LABELS = {"PER", "PERSON"}
 ORGANIZATION_LABELS = {"ORG", "ORGANIZATION"}
 LOCATION_LABELS = {"LOC", "LOCATION", "GPE", "FAC"}
 
-# Required TSV order: timestamps, subtitle text, session title, then entities.
-# SRT sequence numbers are deliberately excluded.
+# Required TSV order: timestamps, subtitle text, session title, then separate
+# columns for places, people, and organizations. SRT sequence numbers are
+# deliberately excluded.
 TSV_HEADERS = [
     "Start Timestamp (HH:MM:SS)",
     "End Timestamp (HH:MM:SS)",
     "Subtitle Text",
     "Session Title",
-    "People, Organizations, and Places",
+    "Place Names",
+    "People's Names",
+    "Organization Names",
 ]
 
 UI_TEXT = {
@@ -62,7 +65,7 @@ UI_TEXT = {
         "intro": (
             "Upload one or more SRT files and convert them into TSV tables. "
             "Milliseconds and SRT sequence numbers are omitted, session titles are carried "
-            "forward, and spaCy extracts people, organizations, and places."
+            "forward, and spaCy extracts places, people, and organizations into separate TSV columns."
         ),
         "session_help_title": "SRT session-title format",
         "session_help": """
@@ -153,7 +156,7 @@ Named entities are identified from the original subtitle cues before merging. Ev
         "intro": (
             "Suba uno o más archivos SRT y conviértalos en tablas TSV. Se omiten los "
             "milisegundos y los números de secuencia, se conservan los títulos de sesión y "
-            "spaCy extrae personas, organizaciones y lugares."
+            "spaCy extrae lugares, personas y organizaciones en columnas TSV separadas."
         ),
         "session_help_title": "Formato del título de sesión en el SRT",
         "session_help": """
@@ -245,7 +248,7 @@ Las entidades se identifican en las secuencias originales antes de unirlas. Cada
         "intro": (
             "Envie um ou mais arquivos SRT e converta-os em tabelas TSV. Os milissegundos e "
             "os números de sequência são omitidos, os títulos das sessões são mantidos e o "
-            "spaCy extrai pessoas, organizações e lugares."
+            "spaCy extrai lugares, pessoas e organizações em colunas TSV separadas."
         ),
         "session_help_title": "Formato do título da sessão no SRT",
         "session_help": """
@@ -1024,7 +1027,7 @@ def get_geocode_rate_limiter() -> Any:
     from geopy.geocoders import Nominatim
 
     geocoder = Nominatim(
-        user_agent="srt-to-tsv-spacy-ner/7.0",
+        user_agent="srt-to-tsv-spacy-ner/8.0",
         timeout=12,
     )
     return RateLimiter(
@@ -1213,14 +1216,16 @@ def records_to_tsv(
     writer.writerow(TSV_HEADERS)
 
     for record in records:
-        entities = session_entities.get(record.session_id, EntityBundle()).combined()
+        entities = session_entities.get(record.session_id, EntityBundle())
         writer.writerow(
             [
                 record.start,
                 record.end,
                 normalize_whitespace(record.text),
                 normalize_whitespace(record.session_title),
-                entities,
+                " | ".join(entities.places),
+                " | ".join(entities.people),
+                " | ".join(entities.organizations),
             ]
         )
 
