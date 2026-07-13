@@ -823,9 +823,6 @@ def deduplicate_preserving_order(values: Iterable[str]) -> list[str]:
     return output
 
 
-SINGLE_WORD_REJECTED_POS = {"VERB", "AUX", "ADJ"}
-
-
 def entity_word_tokens(entity: Any) -> list[Any]:
     """Return non-space, non-punctuation tokens from a spaCy entity span."""
     return [
@@ -835,15 +832,17 @@ def entity_word_tokens(entity: Any) -> list[Any]:
     ]
 
 
-def should_keep_entity(entity: Any) -> bool:
-    """Keep multi-word entities and legitimate one-word named entities.
+def should_keep_entity(entity: Any, label: str, entity_text: str) -> bool:
+    """Apply label-aware precision rules to a spaCy entity.
 
-    Single-token countries, cities, organizations, and personal names are
-    preserved unless spaCy's part-of-speech analysis identifies the token as
-    a verb, auxiliary verb, or adjective. This removes common subtitle false
-    positives while retaining place names such as "México", "Brasil", or
-    "Lisboa". If a model does not provide a POS tag, the entity is retained
-    rather than discarding a potentially valid name.
+    All multi-word people, organizations, and places are retained. For a
+    single-word entity, only geographic entities are retained. Single-word
+    people and organizations are discarded, regardless of their part of
+    speech. This preserves locations such as "México", "Brasil", "Quito",
+    and "Lisboa" while removing common one-word PERSON/ORG false positives.
+
+    A diocese or an explicitly named administrative unit is treated as a
+    place even when the spaCy model labels it as ORG.
     """
     word_tokens = entity_word_tokens(entity)
     if not word_tokens:
@@ -851,9 +850,18 @@ def should_keep_entity(entity: Any) -> bool:
     if len(word_tokens) >= 2:
         return True
 
-    token = word_tokens[0]
-    pos = str(getattr(token, "pos_", "") or "").upper()
-    return pos not in SINGLE_WORD_REJECTED_POS
+    normalized_label = str(label or "").upper()
+    if normalized_label in LOCATION_LABELS:
+        return True
+
+    if normalized_label in ORGANIZATION_LABELS and (
+        DIOCESE_PATTERN.match(entity_text)
+        or ADMINISTRATIVE_PLACE_PATTERN.match(entity_text)
+    ):
+        return True
+
+    # Single-word PERSON and ORG entities are intentionally excluded.
+    return False
 
 
 def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBundle]:
@@ -869,14 +877,14 @@ def extract_raw_entities_batch(texts: Iterable[str], nlp: Any) -> list[EntityBun
         places: list[str] = []
 
         for entity in doc.ents:
-            # Preserve legitimate one-word names and places, but reject
-            # one-word false positives that spaCy tags as verbs or adjectives.
-            if not should_keep_entity(entity):
-                continue
-
             label = str(entity.label_).upper()
             entity_text = clean_entity_value(entity.text)
             if not entity_text:
+                continue
+
+            # Keep one-word locations, but remove every one-word person or
+            # organization before session propagation and TXT generation.
+            if not should_keep_entity(entity, label, entity_text):
                 continue
 
             if label in PERSON_LABELS:
