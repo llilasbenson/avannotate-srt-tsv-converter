@@ -5,21 +5,21 @@ import re
 import zipfile
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v1", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
 
-NER_MODELS = {
-    "en": "en_core_web_sm",
-    "es": "es_core_news_sm",
-    "pt": "pt_core_news_sm",
-}
+APP_VERSION = "1.0"
+
+# Flair's large four-class model recognizes PER, ORG, LOC, and MISC and is
+# multilingual enough for the app's English, Spanish, and Portuguese workflow.
+FLAIR_MODEL_ID = "ner-large"
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -27,27 +27,28 @@ LANGUAGE_NAMES = {
     "pt": "Português",
 }
 
-PERSON_LABELS = {"PERSON", "PER"}
-ORGANIZATION_LABELS = {"ORG"}
+PERSON_LABELS = {"PER", "PERSON"}
+ORGANIZATION_LABELS = {"ORG", "ORGANIZATION"}
+LOCATION_LABELS = {"LOC", "LOCATION", "GPE", "FAC"}
 
+# Required TSV order: timestamps, subtitle text, session title, then entities.
+# SRT sequence numbers are deliberately excluded.
 TSV_HEADERS = [
-    "SRT Sequence Number",
-    "Session Title",
     "Start Timestamp (HH:MM:SS)",
     "End Timestamp (HH:MM:SS)",
     "Subtitle Text",
-    "People and Organizations",
+    "Session Title",
+    "People, Organizations, and Places",
 ]
 
 UI_TEXT = {
     "en": {
         "sidebar_title": "Settings",
-        "interface_language": "Interface language / Idioma da interface",
         "title": "SRT to TSV Converter",
         "intro": (
             "Upload one or more SRT files and convert them into TSV tables. "
-            "Milliseconds are removed from timestamps, session titles are carried forward, "
-            "and named entities are extracted from subtitle text."
+            "Milliseconds and SRT sequence numbers are omitted, session titles are carried "
+            "forward, and Flair extracts people, organizations, and places."
         ),
         "session_help_title": "SRT session-title format",
         "session_help": """
@@ -63,16 +64,31 @@ Welcome to the conference.
 Our first speaker is Ana Silva.
 ```
 
-`Opening Session` is assigned to cue 1 and all following cues until another cue-number line contains a different title.
+`Opening Session` is assigned to cue 1 and all following cues until a different session title appears. The sequence numbers are used only for parsing and are not written to the TSV.
         """,
         "ner_language": "Subtitle language for named-entity recognition",
         "ner_help": (
-            "Choose the language used in the subtitle text. This setting is independent "
-            "of the interface language."
+            "Choose the principal language used in the subtitle text. This setting is "
+            "independent of the interface language."
         ),
         "ner_note": (
-            "NER results require review. Person names are inverted heuristically to "
-            "Family name, Given name; organizations remain in their detected form."
+            "Flair identifies people, organizations, and locations. Person names are inverted "
+            "heuristically to Family name, Given name. NER results and geographic matches "
+            "should be reviewed."
+        ),
+        "resolve_places": "Resolve place names to geographic hierarchies",
+        "resolve_places_help": (
+            "When enabled, detected location names are sent to the OpenStreetMap Nominatim "
+            "service and formatted as country--state/department/diocese--city. A country or "
+            "state reference omits lower levels; unresolved names remain in their detected form."
+        ),
+        "privacy_note": (
+            "Location resolution requires internet access and sends only Flair-detected place "
+            "names—not the complete subtitle text—to Nominatim."
+        ),
+        "osm_attribution": (
+            "Geographic data © [OpenStreetMap contributors]"
+            "(https://www.openstreetmap.org/copyright), used under the ODbL."
         ),
         "mode_label": "Conversion options",
         "simple_mode": "Simple conversion to TSV",
@@ -84,35 +100,40 @@ In merging mode, the app preserves the original speaker-detection behavior:
 - Text after the end timestamp is treated as an explicit speaker name.
 - A subtitle beginning with `-`, `–`, or `—` starts a new unnamed speaker turn.
 - A cue without either marker continues the previous speaker.
-- Cues are never merged across different session titles.
+- Cues are never merged across different sessions.
 
-Merged rows list all contributing sequence numbers as a range when contiguous, or as comma-separated values otherwise. A single unusually long cue may exceed the selected maximum.
+Named entities are identified from the original subtitle cues before merging. Every output row in a session receives the combined entities found anywhere in that same session, but entities do not carry into another session.
         """,
         "target_chars": "Target characters per subtitle block",
         "target_help": "The converter will try to keep merged blocks around this length.",
         "max_chars": "Maximum characters per subtitle block",
         "max_help": "Merged blocks will not exceed this length unless one original cue is already longer.",
         "uploader": "Choose one or more .srt files",
-        "spinner_model": "Loading the named-entity recognition model...",
+        "spinner_model": "Loading the Flair named-entity recognition model...",
         "spinner_processing": "Processing uploaded files...",
-        "missing_model": "The required spaCy language model is not installed.",
-        "install_intro": "Install the model in the same Python environment with:",
+        "missing_model": "Flair or its named-entity model could not be loaded.",
+        "install_intro": "Install the dependencies and restart the app:",
         "decode_error": "Could not decode {filename} as UTF-8.",
         "no_cues": "No valid SRT cues were found in {filename}.",
         "preview": "Preview of TSV output for {filename} (first 20 lines)",
-        "download_one": "Download TSV for {filename}",
-        "download_all": "Download all TSV files as ZIP",
-        "no_results": "No TSV files were created.",
+        "entities_preview": "Entity-list preview for {filename}",
+        "download_tsv": "Download TSV for {filename}",
+        "download_txt": "Download entity TXT for {filename}",
+        "download_all": "Download all TSV and entity TXT files as ZIP",
+        "no_results": "No output files were created.",
         "processed_summary": "Processed {files} file(s) and {rows} TSV row(s).",
+        "people_heading": "People",
+        "organizations_heading": "Organizations",
+        "places_heading": "Places",
+        "none_identified": "None identified",
     },
     "es": {
         "sidebar_title": "Configuración",
-        "interface_language": "Idioma de la interfaz / Interface language",
         "title": "Convertidor de SRT a TSV",
         "intro": (
-            "Suba uno o más archivos SRT y conviértalos en tablas TSV. "
-            "Se eliminan los milisegundos de las marcas de tiempo, se conservan los títulos "
-            "de sesión y se extraen entidades nombradas del texto de los subtítulos."
+            "Suba uno o más archivos SRT y conviértalos en tablas TSV. Se omiten los "
+            "milisegundos y los números de secuencia, se conservan los títulos de sesión y "
+            "Flair extrae personas, organizaciones y lugares."
         ),
         "session_help_title": "Formato del título de sesión en el SRT",
         "session_help": """
@@ -128,17 +149,31 @@ Bienvenidos al congreso.
 Nuestra primera ponente es Ana Silva.
 ```
 
-`Sesión inaugural` se asigna a la secuencia 1 y a las siguientes hasta que otra línea de número de secuencia contenga un título diferente.
+`Sesión inaugural` se asigna a la secuencia 1 y a las siguientes hasta que aparezca un título de sesión diferente. Los números solo se usan para analizar el SRT y no se escriben en el TSV.
         """,
         "ner_language": "Idioma de los subtítulos para el reconocimiento de entidades",
         "ner_help": (
-            "Seleccione el idioma del texto de los subtítulos. Esta opción es independiente "
-            "del idioma de la interfaz."
+            "Seleccione el idioma principal del texto de los subtítulos. Esta opción es "
+            "independiente del idioma de la interfaz."
         ),
         "ner_note": (
-            "Los resultados del reconocimiento de entidades requieren revisión. Los nombres "
-            "de personas se invierten de manera heurística a Apellido, Nombre; las organizaciones "
-            "se conservan en la forma detectada."
+            "Flair identifica personas, organizaciones y lugares. Los nombres de personas se "
+            "invierten de manera heurística a Apellido, Nombre. Se deben revisar los resultados "
+            "del reconocimiento y las coincidencias geográficas."
+        ),
+        "resolve_places": "Resolver los lugares como jerarquías geográficas",
+        "resolve_places_help": (
+            "Al activarse, los lugares detectados se envían al servicio OpenStreetMap Nominatim "
+            "y se formatean como país--estado/departamento/diócesis--ciudad. Una referencia a un "
+            "país o estado omite los niveles inferiores; los lugares no resueltos conservan su forma detectada."
+        ),
+        "privacy_note": (
+            "La resolución geográfica requiere internet y solo envía a Nominatim los nombres de "
+            "lugar detectados por Flair, no el texto completo de los subtítulos."
+        ),
+        "osm_attribution": (
+            "Datos geográficos © [colaboradores de OpenStreetMap]"
+            "(https://www.openstreetmap.org/copyright), utilizados bajo la licencia ODbL."
         ),
         "mode_label": "Opciones de conversión",
         "simple_mode": "Conversión simple a TSV",
@@ -152,33 +187,38 @@ En el modo de unión, la aplicación conserva el comportamiento original de dete
 - Una secuencia sin ninguno de esos indicadores continúa con el hablante anterior.
 - Nunca se unen secuencias de distintas sesiones.
 
-Las filas unidas muestran todos los números de secuencia correspondientes como un rango si son consecutivos o separados por comas si no lo son. Una secuencia individual demasiado larga puede superar el máximo seleccionado.
+Las entidades se identifican en las secuencias originales antes de unirlas. Cada fila de salida de una sesión recibe todas las entidades encontradas en esa misma sesión, pero no se trasladan a otra sesión.
         """,
         "target_chars": "Número objetivo de caracteres por bloque de subtítulos",
         "target_help": "El convertidor intentará mantener los bloques unidos cerca de esta extensión.",
         "max_chars": "Número máximo de caracteres por bloque de subtítulos",
-        "max_help": "Los bloques unidos no superarán esta extensión, salvo que una secuencia original ya sea más larga.",
+        "max_help": "Los bloques no superarán esta extensión, salvo que una secuencia original ya sea más larga.",
         "uploader": "Seleccione uno o más archivos .srt",
-        "spinner_model": "Cargando el modelo de reconocimiento de entidades...",
+        "spinner_model": "Cargando el modelo de reconocimiento de entidades de Flair...",
         "spinner_processing": "Procesando los archivos subidos...",
-        "missing_model": "No está instalado el modelo de idioma de spaCy requerido.",
-        "install_intro": "Instale el modelo en el mismo entorno de Python con:",
+        "missing_model": "No se pudo cargar Flair o su modelo de reconocimiento de entidades.",
+        "install_intro": "Instale las dependencias y reinicie la aplicación:",
         "decode_error": "No se pudo decodificar {filename} como UTF-8.",
         "no_cues": "No se encontraron secuencias SRT válidas en {filename}.",
         "preview": "Vista previa del TSV de {filename} (primeras 20 líneas)",
-        "download_one": "Descargar el TSV de {filename}",
-        "download_all": "Descargar todos los archivos TSV como ZIP",
-        "no_results": "No se creó ningún archivo TSV.",
+        "entities_preview": "Vista previa de la lista de entidades de {filename}",
+        "download_tsv": "Descargar el TSV de {filename}",
+        "download_txt": "Descargar el TXT de entidades de {filename}",
+        "download_all": "Descargar todos los TSV y TXT de entidades como ZIP",
+        "no_results": "No se creó ningún archivo de salida.",
         "processed_summary": "Se procesaron {files} archivo(s) y {rows} fila(s) TSV.",
+        "people_heading": "Personas",
+        "organizations_heading": "Organizaciones",
+        "places_heading": "Lugares",
+        "none_identified": "Ninguno identificado",
     },
     "pt": {
         "sidebar_title": "Configurações",
-        "interface_language": "Idioma da interface / Interface language",
         "title": "Conversor de SRT para TSV",
         "intro": (
-            "Envie um ou mais arquivos SRT e converta-os em tabelas TSV. "
-            "Os milissegundos são removidos dos tempos, os títulos das sessões são mantidos "
-            "e as entidades nomeadas são extraídas do texto das legendas."
+            "Envie um ou mais arquivos SRT e converta-os em tabelas TSV. Os milissegundos e "
+            "os números de sequência são omitidos, os títulos das sessões são mantidos e o "
+            "Flair extrai pessoas, organizações e lugares."
         ),
         "session_help_title": "Formato do título da sessão no SRT",
         "session_help": """
@@ -194,17 +234,31 @@ Bem-vindos ao congresso.
 Nossa primeira palestrante é Ana Silva.
 ```
 
-`Sessão de abertura` é atribuído à sequência 1 e às sequências seguintes até que outra linha de número de sequência contenha um título diferente.
+`Sessão de abertura` é atribuída à sequência 1 e às seguintes até aparecer um título de sessão diferente. Os números são usados apenas para analisar o SRT e não são escritos no TSV.
         """,
         "ner_language": "Idioma das legendas para o reconhecimento de entidades",
         "ner_help": (
-            "Selecione o idioma usado no texto das legendas. Esta opção é independente "
+            "Selecione o idioma principal do texto das legendas. Esta opção é independente "
             "do idioma da interface."
         ),
         "ner_note": (
-            "Os resultados do reconhecimento de entidades precisam ser revisados. Os nomes "
-            "de pessoas são invertidos de forma heurística para Sobrenome, Nome; as organizações "
-            "permanecem na forma detectada."
+            "O Flair identifica pessoas, organizações e lugares. Os nomes de pessoas são "
+            "invertidos de forma heurística para Sobrenome, Nome. Os resultados do reconhecimento "
+            "e as correspondências geográficas devem ser revisados."
+        ),
+        "resolve_places": "Resolver lugares como hierarquias geográficas",
+        "resolve_places_help": (
+            "Quando ativado, os lugares detectados são enviados ao serviço OpenStreetMap "
+            "Nominatim e formatados como país--estado/departamento/diocese--cidade. Uma referência "
+            "a país ou estado omite níveis inferiores; lugares não resolvidos mantêm a forma detectada."
+        ),
+        "privacy_note": (
+            "A resolução geográfica requer internet e envia ao Nominatim apenas os nomes de "
+            "lugares detectados pelo Flair, não o texto completo das legendas."
+        ),
+        "osm_attribution": (
+            "Dados geográficos © [colaboradores do OpenStreetMap]"
+            "(https://www.openstreetmap.org/copyright), utilizados sob a licença ODbL."
         ),
         "mode_label": "Opções de conversão",
         "simple_mode": "Conversão simples para TSV",
@@ -218,24 +272,30 @@ No modo de união, o aplicativo preserva o comportamento original de detecção 
 - Uma sequência sem nenhum desses indicadores continua com o falante anterior.
 - Sequências de sessões diferentes nunca são unidas.
 
-As linhas unidas mostram todos os números de sequência correspondentes como um intervalo quando são consecutivos ou separados por vírgulas nos demais casos. Uma sequência individual muito longa pode ultrapassar o máximo selecionado.
+As entidades são identificadas nas sequências originais antes da união. Cada linha de saída de uma sessão recebe todas as entidades encontradas nessa mesma sessão, sem transferi-las para outra sessão.
         """,
         "target_chars": "Meta de caracteres por bloco de legendas",
         "target_help": "O conversor tentará manter os blocos unidos próximos deste tamanho.",
         "max_chars": "Máximo de caracteres por bloco de legendas",
-        "max_help": "Os blocos unidos não ultrapassarão este tamanho, salvo quando uma sequência original já for maior.",
+        "max_help": "Os blocos não ultrapassarão este tamanho, salvo quando uma sequência original já for maior.",
         "uploader": "Escolha um ou mais arquivos .srt",
-        "spinner_model": "Carregando o modelo de reconhecimento de entidades...",
+        "spinner_model": "Carregando o modelo de reconhecimento de entidades do Flair...",
         "spinner_processing": "Processando os arquivos enviados...",
-        "missing_model": "O modelo de idioma spaCy necessário não está instalado.",
-        "install_intro": "Instale o modelo no mesmo ambiente Python com:",
+        "missing_model": "Não foi possível carregar o Flair ou seu modelo de reconhecimento de entidades.",
+        "install_intro": "Instale as dependências e reinicie o aplicativo:",
         "decode_error": "Não foi possível decodificar {filename} como UTF-8.",
         "no_cues": "Nenhuma sequência SRT válida foi encontrada em {filename}.",
         "preview": "Prévia do TSV de {filename} (primeiras 20 linhas)",
-        "download_one": "Baixar o TSV de {filename}",
-        "download_all": "Baixar todos os arquivos TSV como ZIP",
-        "no_results": "Nenhum arquivo TSV foi criado.",
+        "entities_preview": "Prévia da lista de entidades de {filename}",
+        "download_tsv": "Baixar o TSV de {filename}",
+        "download_txt": "Baixar o TXT de entidades de {filename}",
+        "download_all": "Baixar todos os TSV e TXT de entidades como ZIP",
+        "no_results": "Nenhum arquivo de saída foi criado.",
         "processed_summary": "Foram processados {files} arquivo(s) e {rows} linha(s) TSV.",
+        "people_heading": "Pessoas",
+        "organizations_heading": "Organizações",
+        "places_heading": "Lugares",
+        "none_identified": "Nenhum identificado",
     },
 }
 
@@ -245,6 +305,7 @@ As linhas unidas mostram todos os números de sequência correspondentes como um
 @dataclass(frozen=True)
 class SRTCue:
     sequence_number: str
+    session_id: int
     session_title: str
     start: str
     end: str
@@ -255,6 +316,7 @@ class SRTCue:
 @dataclass(frozen=True)
 class SpeakerSegment:
     sequence_number: str
+    session_id: int
     session_title: str
     start_td: timedelta
     end_td: timedelta
@@ -264,11 +326,22 @@ class SpeakerSegment:
 
 @dataclass(frozen=True)
 class OutputRecord:
-    sequence_numbers: tuple[str, ...]
+    session_id: int
     session_title: str
     start: str
     end: str
     text: str
+
+
+@dataclass(frozen=True)
+class EntityBundle:
+    people: tuple[str, ...] = ()
+    organizations: tuple[str, ...] = ()
+    places: tuple[str, ...] = ()
+
+    def combined(self) -> str:
+        values = [*self.people, *self.organizations, *self.places]
+        return " | ".join(values)
 
 
 # ---------- Time and text helpers ----------
@@ -282,9 +355,30 @@ TIME_PATTERN = re.compile(
 SEQUENCE_PATTERN = re.compile(r"^\s*(\d+)(?:[\t ]+(.+?))?\s*$")
 SRT_SETTING_PATTERN = re.compile(r"\b(?:align|line|position|size|vertical):", re.IGNORECASE)
 
+DIOCESE_PATTERN = re.compile(
+    r"^\s*(?:the\s+)?(?:archdiocese|diocese|arquidi[oó]cesis|di[oó]cesis|"
+    r"arquidiocese|diocese)\s+(?:of|de|do|da)\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+ADMINISTRATIVE_PLACE_PATTERN = re.compile(
+    r"^\s*(?:state|province|department|departamento|département|estado|provincia|"
+    r"regi[aã]o|region|región|diocese|archdiocese|diócesis|arquidiócesis|"
+    r"diocese|arquidiocese)\b",
+    re.IGNORECASE,
+)
+
+
+LocationResolver = Callable[[str, str], str]
+
 
 def normalize_whitespace(value: str) -> str:
     return " ".join((value or "").replace("\t", " ").split())
+
+
+def clean_entity_value(value: str) -> str:
+    """Keep the pipe character reserved as the TSV entity separator."""
+    return normalize_whitespace(value).replace("|", "/").strip(" ,;:")
 
 
 def time_to_hhmmss(time_str: str) -> str:
@@ -321,21 +415,23 @@ def looks_like_cue_start(lines: list[str], index: int) -> bool:
 
 def parse_srt(file_content: str) -> list[SRTCue]:
     """
-    Parse standard SRT cues plus the requested extended cue-number syntax:
+    Parse standard SRT cues plus the extended cue-number syntax:
 
         1 Session title
         00:00:01,000 --> 00:00:04,000
         Subtitle text
 
-    A non-empty session title persists until another cue-number line supplies one.
-    Optional text after the end timestamp is retained as a speaker name for the
-    app's existing speaker-merging mode.
+    A non-empty session title persists until a different title is supplied. Each
+    contiguous session receives an internal session_id so entities never leak into
+    another session, even when a title is reused later in the file.
     """
     normalized_content = file_content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized_content.split("\n")
 
     cues: list[SRTCue] = []
     current_session_title = ""
+    current_session_id = 0
+    next_session_id = 1
     index = 0
 
     while index < len(lines):
@@ -347,9 +443,11 @@ def parse_srt(file_content: str) -> list[SRTCue]:
             continue
 
         sequence_number = sequence_match.group(1)
-        session_title = normalize_whitespace(sequence_match.group(2) or "")
-        if session_title:
-            current_session_title = session_title
+        supplied_session_title = normalize_whitespace(sequence_match.group(2) or "")
+        if supplied_session_title and supplied_session_title != current_session_title:
+            current_session_title = supplied_session_title
+            current_session_id = next_session_id
+            next_session_id += 1
 
         index += 1
         while index < len(lines) and not lines[index].strip():
@@ -393,6 +491,7 @@ def parse_srt(file_content: str) -> list[SRTCue]:
         cues.append(
             SRTCue(
                 sequence_number=sequence_number,
+                session_id=current_session_id,
                 session_title=current_session_title,
                 start=start,
                 end=end,
@@ -410,9 +509,15 @@ def build_speaker_segments(cues: Iterable[SRTCue]) -> list[SpeakerSegment]:
     """Apply the original speaker-detection rules to parsed SRT cues."""
     segments: list[SpeakerSegment] = []
     last_speaker_label: Optional[str] = None
+    last_session_id: Optional[int] = None
     anonymous_speaker_count = 0
 
     for cue in cues:
+        if last_session_id is not None and cue.session_id != last_session_id:
+            last_speaker_label = None
+            anonymous_speaker_count = 0
+        last_session_id = cue.session_id
+
         raw_text = cue.text or ""
         cleaned_text = raw_text.strip()
 
@@ -433,6 +538,7 @@ def build_speaker_segments(cues: Iterable[SRTCue]) -> list[SpeakerSegment]:
         segments.append(
             SpeakerSegment(
                 sequence_number=cue.sequence_number,
+                session_id=cue.session_id,
                 session_title=cue.session_title,
                 start_td=hhmmss_to_timedelta(cue.start),
                 end_td=hhmmss_to_timedelta(cue.end),
@@ -449,41 +555,41 @@ def merge_segments_by_speaker(
     target_chars: int = 250,
     max_chars: int = 300,
 ) -> list[OutputRecord]:
-    """
-    Merge consecutive segments from the same speaker and session.
-
-    target_chars is retained for compatibility with the original app. max_chars
-    remains the hard merge threshold except when one source cue is already longer.
-    """
+    """Merge consecutive segments from the same speaker and internal session."""
     segment_list = list(segments)
     if not segment_list:
         return []
 
     merged: list[OutputRecord] = []
-    current_sequences: list[str] = []
-    current_session = ""
+    current_session_id: Optional[int] = None
+    current_session_title = ""
     current_speaker: Optional[str] = None
     current_start: Optional[timedelta] = None
     current_end: Optional[timedelta] = None
     current_text_parts: list[str] = []
 
     def flush_current() -> None:
-        nonlocal current_sequences, current_session, current_speaker
+        nonlocal current_session_id, current_session_title, current_speaker
         nonlocal current_start, current_end, current_text_parts
 
-        if current_speaker is not None and current_start is not None and current_end is not None:
+        if (
+            current_session_id is not None
+            and current_speaker is not None
+            and current_start is not None
+            and current_end is not None
+        ):
             merged.append(
                 OutputRecord(
-                    sequence_numbers=tuple(current_sequences),
-                    session_title=current_session,
+                    session_id=current_session_id,
+                    session_title=current_session_title,
                     start=timedelta_to_hhmmss(current_start),
                     end=timedelta_to_hhmmss(current_end),
                     text=normalize_whitespace(" ".join(current_text_parts)),
                 )
             )
 
-        current_sequences = []
-        current_session = ""
+        current_session_id = None
+        current_session_title = ""
         current_speaker = None
         current_start = None
         current_end = None
@@ -491,8 +597,8 @@ def merge_segments_by_speaker(
 
     for segment in segment_list:
         if current_speaker is None:
-            current_sequences = [segment.sequence_number]
-            current_session = segment.session_title
+            current_session_id = segment.session_id
+            current_session_title = segment.session_title
             current_speaker = segment.speaker_label
             current_start = segment.start_td
             current_end = segment.end_td
@@ -500,12 +606,12 @@ def merge_segments_by_speaker(
             continue
 
         speaker_changed = segment.speaker_label != current_speaker
-        session_changed = segment.session_title != current_session
+        session_changed = segment.session_id != current_session_id
 
         if speaker_changed or session_changed:
             flush_current()
-            current_sequences = [segment.sequence_number]
-            current_session = segment.session_title
+            current_session_id = segment.session_id
+            current_session_title = segment.session_title
             current_speaker = segment.speaker_label
             current_start = segment.start_td
             current_end = segment.end_td
@@ -516,16 +622,14 @@ def merge_segments_by_speaker(
         candidate_length = len(current_text) + (1 if current_text and segment.text else 0) + len(segment.text)
 
         if candidate_length <= max_chars:
-            current_sequences.append(segment.sequence_number)
             current_text_parts.append(segment.text)
             current_end = segment.end_td
         else:
-            # Flush at the maximum boundary. target_chars is intentionally retained
-            # as the desired block size, but the original app also prioritized max_chars.
+            # target_chars remains the preferred size; max_chars is the merge boundary.
             _ = target_chars
             flush_current()
-            current_sequences = [segment.sequence_number]
-            current_session = segment.session_title
+            current_session_id = segment.session_id
+            current_session_title = segment.session_title
             current_speaker = segment.speaker_label
             current_start = segment.start_td
             current_end = segment.end_td
@@ -538,7 +642,7 @@ def merge_segments_by_speaker(
 def cues_to_simple_records(cues: Iterable[SRTCue]) -> list[OutputRecord]:
     return [
         OutputRecord(
-            sequence_numbers=(cue.sequence_number,),
+            session_id=cue.session_id,
             session_title=cue.session_title,
             start=cue.start,
             end=cue.end,
@@ -548,42 +652,13 @@ def cues_to_simple_records(cues: Iterable[SRTCue]) -> list[OutputRecord]:
     ]
 
 
-def format_sequence_numbers(sequence_numbers: Iterable[str]) -> str:
-    values = list(sequence_numbers)
-    if not values:
-        return ""
-    if len(values) == 1:
-        return values[0]
-
-    try:
-        numbers = [int(value) for value in values]
-    except ValueError:
-        return ", ".join(values)
-
-    if numbers == list(range(numbers[0], numbers[-1] + 1)):
-        return f"{numbers[0]}-{numbers[-1]}"
-
-    return ", ".join(values)
-
-
-# ---------- Named-entity recognition ----------
+# ---------- Named-entity recognition with Flair ----------
 
 @st.cache_resource(show_spinner=False)
-def load_ner_model(language_code: str) -> Any:
-    import spacy
+def load_ner_model() -> Any:
+    from flair.nn import Classifier
 
-    model_name = NER_MODELS[language_code]
-    nlp = spacy.load(model_name)
-
-    # Keep the NER component and its feature-producing dependency; disable other
-    # components to reduce processing time without making assumptions about which
-    # optional components are present in each language pipeline.
-    keep_components = {"ner", "tok2vec", "transformer"}
-    for component_name in list(nlp.pipe_names):
-        if component_name not in keep_components:
-            nlp.disable_pipe(component_name)
-
-    return nlp
+    return Classifier.load(FLAIR_MODEL_ID)
 
 
 def clean_text_for_ner(text: str) -> str:
@@ -594,7 +669,7 @@ def clean_text_for_ner(text: str) -> str:
 
 def format_person_name(name: str) -> str:
     """Heuristically invert a detected person name to Family name, Given name."""
-    cleaned = normalize_whitespace(name).strip(" ,;:")
+    cleaned = clean_entity_value(name)
     if not cleaned:
         return ""
 
@@ -606,7 +681,7 @@ def format_person_name(name: str) -> str:
     tokens = cleaned.split()
     honorifics = {
         "mr", "mrs", "ms", "miss", "dr", "prof", "sir", "dame",
-        "sr", "sra", "srta", "dr", "dra", "professor", "professora",
+        "sr", "sra", "srta", "dra", "professor", "professora",
         "dom", "dona", "don", "doña",
     }
     while len(tokens) > 1 and tokens[0].casefold().rstrip(".") in honorifics:
@@ -640,7 +715,7 @@ def deduplicate_preserving_order(values: Iterable[str]) -> list[str]:
     output: list[str] = []
 
     for value in values:
-        normalized = normalize_whitespace(value)
+        normalized = clean_entity_value(value)
         key = normalized.casefold()
         if normalized and key not in seen:
             seen.add(key)
@@ -649,47 +724,272 @@ def deduplicate_preserving_order(values: Iterable[str]) -> list[str]:
     return output
 
 
-def extract_entities_batch(texts: Iterable[str], nlp: Any) -> list[str]:
+def _span_label_value(span: Any) -> str:
+    """Read a Flair span label across current and older supported Flair APIs."""
+    try:
+        return str(span.get_label("ner").value)
+    except (AttributeError, IndexError, KeyError):
+        labels = getattr(span, "labels", [])
+        return str(labels[0].value) if labels else ""
+
+
+def extract_raw_entities_batch(texts: Iterable[str], tagger: Any) -> list[EntityBundle]:
+    """Run Flair NER over subtitle cues and return detected raw entities per cue."""
+    from flair.data import Sentence
+
     cleaned_texts = [clean_text_for_ner(text) for text in texts]
-    results: list[str] = []
+    results = [EntityBundle() for _ in cleaned_texts]
 
-    for doc in nlp.pipe(cleaned_texts, batch_size=32):
-        entities: list[str] = []
+    sentence_indices: list[int] = []
+    sentences: list[Any] = []
+    for index, text in enumerate(cleaned_texts):
+        if text:
+            sentence_indices.append(index)
+            sentences.append(Sentence(text))
 
-        for entity in doc.ents:
-            label = entity.label_.upper()
-            entity_text = normalize_whitespace(entity.text)
+    if not sentences:
+        return results
+
+    tagger.predict(sentences, mini_batch_size=16)
+
+    for source_index, sentence in zip(sentence_indices, sentences):
+        people: list[str] = []
+        organizations: list[str] = []
+        places: list[str] = []
+
+        for span in sentence.get_spans("ner"):
+            label = _span_label_value(span).upper()
+            entity_text = clean_entity_value(getattr(span, "text", ""))
+            if not entity_text:
+                continue
 
             if label in PERSON_LABELS:
-                formatted = format_person_name(entity_text)
-                if formatted:
-                    entities.append(formatted)
-            elif label in ORGANIZATION_LABELS and entity_text:
-                entities.append(entity_text)
+                formatted_person = format_person_name(entity_text)
+                if formatted_person:
+                    people.append(formatted_person)
+            elif label in LOCATION_LABELS:
+                places.append(entity_text)
+            elif label in ORGANIZATION_LABELS:
+                # Dioceses and explicitly named administrative units are geographic
+                # entities for this workflow even when a model labels them ORG.
+                if DIOCESE_PATTERN.match(entity_text) or ADMINISTRATIVE_PLACE_PATTERN.match(entity_text):
+                    places.append(entity_text)
+                else:
+                    organizations.append(entity_text)
 
-        results.append(" | ".join(deduplicate_preserving_order(entities)))
+        results[source_index] = EntityBundle(
+            people=tuple(deduplicate_preserving_order(people)),
+            organizations=tuple(deduplicate_preserving_order(organizations)),
+            places=tuple(deduplicate_preserving_order(places)),
+        )
 
     return results
 
 
-# ---------- TSV generation ----------
+# ---------- Geographic hierarchy resolution ----------
 
-def records_to_tsv(records: Iterable[OutputRecord], nlp: Any) -> str:
-    record_list = list(records)
-    entity_values = extract_entities_batch((record.text for record in record_list), nlp)
+@st.cache_resource(show_spinner=False)
+def get_geocode_rate_limiter() -> Any:
+    from geopy.extra.rate_limiter import RateLimiter
+    from geopy.geocoders import Nominatim
 
+    geocoder = Nominatim(
+        user_agent="srt-to-tsv-flair-ner/1.0",
+        timeout=12,
+    )
+    return RateLimiter(
+        geocoder.geocode,
+        min_delay_seconds=1.1,
+        max_retries=1,
+        error_wait_seconds=2.0,
+        swallow_exceptions=True,
+    )
+
+
+def first_nonempty(mapping: dict[str, Any], keys: Iterable[str]) -> str:
+    for key in keys:
+        value = clean_entity_value(str(mapping.get(key, "")))
+        if value:
+            return value
+    return ""
+
+
+def first_display_component(location: Any) -> str:
+    address = clean_entity_value(getattr(location, "address", ""))
+    return clean_entity_value(address.split(",", 1)[0]) if address else ""
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24 * 30)
+def resolve_location_hierarchy(location_name: str, language_code: str) -> str:
+    """
+    Resolve a Flair-detected location to country--state/department/diocese--city.
+
+    The hierarchy stops at the type of place referenced: countries omit state and
+    city; first-level administrative units omit city; populated places include all
+    available levels. If no match is found, the detected location is returned.
+    """
+    original = clean_entity_value(location_name)
+    if not original:
+        return ""
+
+    diocese_match = DIOCESE_PATTERN.match(original)
+    query = clean_entity_value(diocese_match.group(1)) if diocese_match else original
+
+    try:
+        geocode = get_geocode_rate_limiter()
+        location = geocode(
+            query,
+            exactly_one=True,
+            addressdetails=True,
+            language=language_code,
+        )
+    except Exception:
+        return original
+
+    if location is None:
+        return original
+
+    raw = getattr(location, "raw", {}) or {}
+    address = raw.get("address", {}) or {}
+    feature_type = clean_entity_value(
+        str(raw.get("addresstype") or raw.get("type") or "")
+    ).casefold()
+
+    country = first_nonempty(address, ["country"])
+    state = first_nonempty(
+        address,
+        ["state", "province", "region", "state_district", "department"],
+    )
+    city = first_nonempty(
+        address,
+        ["city", "town", "village", "municipality", "hamlet", "locality", "borough"],
+    )
+    display_component = first_display_component(location)
+
+    if diocese_match:
+        # A diocese occupies the middle hierarchy level. Do not invent a city level.
+        parts = [country, original]
+        return "--".join(part for part in deduplicate_preserving_order(parts) if part) or original
+
+    country_types = {"country"}
+    administrative_types = {
+        "state", "province", "region", "state_district", "department", "administrative",
+    }
+    populated_place_types = {
+        "city", "town", "village", "municipality", "hamlet", "locality", "borough",
+        "suburb", "quarter", "neighbourhood",
+    }
+
+    if feature_type in country_types:
+        parts = [country or display_component]
+    elif feature_type in administrative_types:
+        parts = [country, state or display_component]
+    elif feature_type in populated_place_types or city:
+        parts = [country, state, city or display_component]
+    else:
+        # For landmarks and other location types, use the available hierarchy and
+        # keep the referenced feature as the most specific level when appropriate.
+        most_specific = city or display_component
+        parts = [country, state, most_specific]
+
+    formatted = "--".join(part for part in deduplicate_preserving_order(parts) if part)
+    return formatted or original
+
+
+# ---------- Session-level entity aggregation ----------
+
+def aggregate_session_entities(
+    cues: Iterable[SRTCue],
+    tagger: Any,
+    language_code: str,
+    resolve_places: bool = True,
+    location_resolver: LocationResolver = resolve_location_hierarchy,
+) -> tuple[dict[int, EntityBundle], EntityBundle]:
+    """
+    Aggregate entities per internal session and for the complete file.
+
+    Each TSV row later receives the complete bundle for its own session_id. This is
+    intentionally based on original cues rather than merged output rows.
+    """
+    cue_list = list(cues)
+    raw_entities = extract_raw_entities_batch((cue.text for cue in cue_list), tagger)
+
+    session_people: dict[int, list[str]] = {}
+    session_organizations: dict[int, list[str]] = {}
+    session_places: dict[int, list[str]] = {}
+
+    all_people: list[str] = []
+    all_organizations: list[str] = []
+    all_places: list[str] = []
+    resolved_location_cache: dict[str, str] = {}
+
+    for cue, cue_entities in zip(cue_list, raw_entities):
+        session_people.setdefault(cue.session_id, [])
+        session_organizations.setdefault(cue.session_id, [])
+        session_places.setdefault(cue.session_id, [])
+
+        for person in cue_entities.people:
+            session_people[cue.session_id].append(person)
+            all_people.append(person)
+
+        for organization in cue_entities.organizations:
+            session_organizations[cue.session_id].append(organization)
+            all_organizations.append(organization)
+
+        for raw_place in cue_entities.places:
+            cache_key = raw_place.casefold()
+            if resolve_places:
+                if cache_key not in resolved_location_cache:
+                    resolved_location_cache[cache_key] = location_resolver(raw_place, language_code)
+                place = resolved_location_cache[cache_key]
+            else:
+                place = raw_place
+
+            if place:
+                session_places[cue.session_id].append(place)
+                all_places.append(place)
+
+    session_ids = {
+        *session_people.keys(),
+        *session_organizations.keys(),
+        *session_places.keys(),
+    }
+    session_bundles: dict[int, EntityBundle] = {}
+    for session_id in session_ids:
+        session_bundles[session_id] = EntityBundle(
+            people=tuple(deduplicate_preserving_order(session_people.get(session_id, []))),
+            organizations=tuple(
+                deduplicate_preserving_order(session_organizations.get(session_id, []))
+            ),
+            places=tuple(deduplicate_preserving_order(session_places.get(session_id, []))),
+        )
+
+    file_bundle = EntityBundle(
+        people=tuple(deduplicate_preserving_order(all_people)),
+        organizations=tuple(deduplicate_preserving_order(all_organizations)),
+        places=tuple(deduplicate_preserving_order(all_places)),
+    )
+    return session_bundles, file_bundle
+
+
+# ---------- TSV and TXT generation ----------
+
+def records_to_tsv(
+    records: Iterable[OutputRecord],
+    session_entities: dict[int, EntityBundle],
+) -> str:
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
     writer.writerow(TSV_HEADERS)
 
-    for record, entities in zip(record_list, entity_values):
+    for record in records:
+        entities = session_entities.get(record.session_id, EntityBundle()).combined()
         writer.writerow(
             [
-                format_sequence_numbers(record.sequence_numbers),
-                normalize_whitespace(record.session_title),
                 record.start,
                 record.end,
                 normalize_whitespace(record.text),
+                normalize_whitespace(record.session_title),
                 entities,
             ]
         )
@@ -697,28 +997,75 @@ def records_to_tsv(records: Iterable[OutputRecord], nlp: Any) -> str:
     return output.getvalue()
 
 
-def convert_srt_to_tsv(
+def entities_to_txt(
+    entities: EntityBundle,
+    people_heading: str = "People",
+    organizations_heading: str = "Organizations",
+    places_heading: str = "Places",
+    none_identified: str = "None identified",
+) -> str:
+    sections = [
+        (people_heading, entities.people),
+        (organizations_heading, entities.organizations),
+        (places_heading, entities.places),
+    ]
+
+    lines: list[str] = []
+    for index, (heading, values) in enumerate(sections):
+        if index:
+            lines.append("")
+        lines.append(heading)
+        lines.append("=" * len(heading))
+        if values:
+            lines.extend(values)
+        else:
+            lines.append(none_identified)
+
+    return "\n".join(lines) + "\n"
+
+
+def convert_srt(
     file_content: str,
-    nlp: Any,
+    tagger: Any,
+    language_code: str,
+    resolve_places: bool = True,
     merge_by_speaker: bool = False,
     target_chars: int = 250,
     max_chars: int = 300,
-) -> tuple[str, int]:
+    location_resolver: LocationResolver = resolve_location_hierarchy,
+    txt_headings: Optional[dict[str, str]] = None,
+) -> tuple[str, str, int]:
     cues = parse_srt(file_content)
     if not cues:
-        return "", 0
+        return "", "", 0
 
     if merge_by_speaker:
-        segments = build_speaker_segments(cues)
         records = merge_segments_by_speaker(
-            segments,
+            build_speaker_segments(cues),
             target_chars=target_chars,
             max_chars=max_chars,
         )
     else:
         records = cues_to_simple_records(cues)
 
-    return records_to_tsv(records, nlp), len(records)
+    session_entities, file_entities = aggregate_session_entities(
+        cues,
+        tagger=tagger,
+        language_code=language_code,
+        resolve_places=resolve_places,
+        location_resolver=location_resolver,
+    )
+
+    headings = txt_headings or {}
+    tsv_text = records_to_tsv(records, session_entities)
+    txt_text = entities_to_txt(
+        file_entities,
+        people_heading=headings.get("people", "People"),
+        organizations_heading=headings.get("organizations", "Organizations"),
+        places_heading=headings.get("places", "Places"),
+        none_identified=headings.get("none", "None identified"),
+    )
+    return tsv_text, txt_text, len(records)
 
 
 # ---------- Streamlit interface ----------
@@ -733,7 +1080,7 @@ T = UI_TEXT[interface_language]
 
 st.sidebar.caption(T["sidebar_title"])
 
-st.title(T["title"])
+st.title(f"{T["title"]} — v{APP_VERSION}")
 st.write(T["intro"])
 
 with st.expander(T["session_help_title"], expanded=False):
@@ -747,6 +1094,15 @@ ner_language = st.selectbox(
     help=T["ner_help"],
 )
 st.caption(T["ner_note"])
+
+resolve_places_option = st.checkbox(
+    T["resolve_places"],
+    value=True,
+    help=T["resolve_places_help"],
+)
+if resolve_places_option:
+    st.caption(T["privacy_note"])
+    st.markdown(T["osm_attribution"])
 
 mode = st.radio(
     T["mode_label"],
@@ -787,16 +1143,21 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     try:
         with st.spinner(T["spinner_model"]):
-            nlp_model = load_ner_model(ner_language)
-    except (ImportError, OSError) as error:
-        model_name = NER_MODELS[ner_language]
-        st.error(f"{T['missing_model']} ({model_name})")
+            ner_model = load_ner_model()
+    except Exception as error:
+        st.error(f"{T['missing_model']} ({FLAIR_MODEL_ID})")
         st.write(T["install_intro"])
-        st.code(f"python -m spacy download {model_name}", language="bash")
+        st.code("pip install -r requirements.txt", language="bash")
         st.exception(error)
         st.stop()
 
-    tsv_results: list[tuple[str, str, int]] = []
+    results: list[tuple[str, str, str, int]] = []
+    txt_headings = {
+        "people": T["people_heading"],
+        "organizations": T["organizations_heading"],
+        "places": T["places_heading"],
+        "none": T["none_identified"],
+    }
 
     with st.spinner(T["spinner_processing"]):
         for uploaded_file in uploaded_files:
@@ -807,51 +1168,69 @@ if uploaded_files:
                 st.error(T["decode_error"].format(filename=uploaded_file.name))
                 continue
 
-            tsv_text, row_count = convert_srt_to_tsv(
+            tsv_text, entity_txt, row_count = convert_srt(
                 file_text,
-                nlp=nlp_model,
+                tagger=ner_model,
+                language_code=ner_language,
+                resolve_places=resolve_places_option,
                 merge_by_speaker=(mode == "merged"),
                 target_chars=int(target_chars),
                 max_chars=int(max_chars),
+                txt_headings=txt_headings,
             )
 
             if not tsv_text:
                 st.warning(T["no_cues"].format(filename=uploaded_file.name))
                 continue
 
-            tsv_results.append((uploaded_file.name, tsv_text, row_count))
+            results.append((uploaded_file.name, tsv_text, entity_txt, row_count))
 
-    if not tsv_results:
+    if not results:
         st.error(T["no_results"])
         st.stop()
 
-    total_rows = sum(result[2] for result in tsv_results)
-    st.success(T["processed_summary"].format(files=len(tsv_results), rows=total_rows))
+    total_rows = sum(result[3] for result in results)
+    st.success(T["processed_summary"].format(files=len(results), rows=total_rows))
 
-    first_name, first_tsv, _ = tsv_results[0]
+    first_name, first_tsv, first_txt, _ = results[0]
     st.subheader(T["preview"].format(filename=first_name))
-    preview_lines = "\n".join(first_tsv.splitlines()[:20])
-    st.text(preview_lines)
+    st.text("\n".join(first_tsv.splitlines()[:20]))
 
-    if len(tsv_results) == 1:
-        output_name = first_name.rsplit(".", 1)[0] + ".tsv"
-        st.download_button(
-            label=T["download_one"].format(filename=first_name),
-            data=first_tsv.encode("utf-8-sig"),
-            file_name=output_name,
-            mime="text/tab-separated-values",
-        )
+    with st.expander(T["entities_preview"].format(filename=first_name), expanded=False):
+        st.text(first_txt)
+
+    if len(results) == 1:
+        base_name = first_name.rsplit(".", 1)[0]
+        left_column, right_column = st.columns(2)
+        with left_column:
+            st.download_button(
+                label=T["download_tsv"].format(filename=first_name),
+                data=first_tsv.encode("utf-8-sig"),
+                file_name=base_name + ".tsv",
+                mime="text/tab-separated-values",
+            )
+        with right_column:
+            st.download_button(
+                label=T["download_txt"].format(filename=first_name),
+                data=first_txt.encode("utf-8-sig"),
+                file_name=base_name + "_entities.txt",
+                mime="text/plain",
+            )
     else:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for original_name, tsv_text, _ in tsv_results:
-                tsv_name = original_name.rsplit(".", 1)[0] + ".tsv"
-                zip_file.writestr(tsv_name, tsv_text.encode("utf-8-sig"))
+            for original_name, tsv_text, entity_txt, _ in results:
+                base_name = original_name.rsplit(".", 1)[0]
+                zip_file.writestr(base_name + ".tsv", tsv_text.encode("utf-8-sig"))
+                zip_file.writestr(
+                    base_name + "_entities.txt",
+                    entity_txt.encode("utf-8-sig"),
+                )
 
         zip_buffer.seek(0)
         st.download_button(
             label=T["download_all"],
             data=zip_buffer,
-            file_name="converted_srt_tsv_files.zip",
+            file_name="converted_srt_outputs.zip",
             mime="application/zip",
         )
