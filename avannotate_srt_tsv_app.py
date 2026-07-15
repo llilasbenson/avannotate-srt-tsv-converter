@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV Converter v8", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV AVAnnoatet Converter", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
