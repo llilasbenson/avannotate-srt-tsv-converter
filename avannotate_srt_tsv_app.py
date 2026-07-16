@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import zipfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Iterable, Optional
@@ -13,7 +14,7 @@ from typing import Any, Callable, Iterable, Optional
 import streamlit as st
 
 
-st.set_page_config(page_title="SRT to TSV AVAnnoatet Converter", page_icon="📝", layout="wide")
+st.set_page_config(page_title="SRT to TSV Converter v8", page_icon="📝", layout="wide")
 
 
 # ---------- Configuration ----------
@@ -1232,6 +1233,16 @@ def records_to_tsv(
     return output.getvalue()
 
 
+def alphabetical_sort_key(value: str) -> tuple[str, str]:
+    """Return a case- and accent-insensitive key while preserving display text."""
+    normalized = unicodedata.normalize("NFKD", normalize_whitespace(value))
+    without_accents = "".join(
+        character for character in normalized
+        if not unicodedata.combining(character)
+    )
+    return without_accents.casefold(), value.casefold()
+
+
 def entities_to_txt(
     entities: EntityBundle,
     people_heading: str = "People",
@@ -1239,10 +1250,14 @@ def entities_to_txt(
     places_heading: str = "Places",
     none_identified: str = "None identified",
 ) -> str:
+    """Create the entity TXT export with each category alphabetized."""
     sections = [
-        (people_heading, entities.people),
-        (organizations_heading, entities.organizations),
-        (places_heading, entities.places),
+        (people_heading, sorted(entities.people, key=alphabetical_sort_key)),
+        (places_heading, sorted(entities.places, key=alphabetical_sort_key)),
+        (
+            organizations_heading,
+            sorted(entities.organizations, key=alphabetical_sort_key),
+        ),
     ]
 
     lines: list[str] = []
